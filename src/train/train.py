@@ -1,7 +1,7 @@
 from src.model.dcft import DCFT
+from src.utils.loss import DCFTLoss
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -28,14 +28,14 @@ def load_base_model(model_name, label_map):
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2, id2label=label_map['id2label'], label2id=label_map['label2id'])
     return tokenizer, model
 
-def get_dcft_mode(model, d, k):        
+def get_dcft_mode(model, d, k, dropout_rate):        
     for layer in model.deberta.encoder.layer:
         attn = layer.attention.self
-        for attr in ["in_proj", "pos_proj"]:
-            setattr(attn, attr, DCFT(layer=getattr(attn, attr), d=d, k=k))
+        for attr in ["query_proj", "key_proj", "value_proj"]:
+            setattr(attn, attr, DCFT(layer=getattr(attn, attr), d=d, k=k, dropout_rate=dropout_rate))
     
     for name, param in model.named_parameters():
-        if not any(module in name for module in ["in_proj", "pos_proj"]) or 'base_layer' in name:
+        if not any(module in name for module in ["query_proj", "key_proj", "value_proj"]) or 'base_layer' in name:
             param.requires_grad = False
     return model
 
@@ -57,7 +57,7 @@ def train(model, num_epochs, optimizer, scheduler, train_dataloader, validation_
             optimizer.zero_grad()
             
             logits = model(**batch).logits
-            loss = criterion(logits, labels)
+            loss = criterion(model, logits, labels)
 
             loss.backward()
             
@@ -91,7 +91,7 @@ def evaluate(model, dataloader, criterion, device="cuda"):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             logits = model(**batch).logits
-            loss = criterion(logits, labels)
+            loss = criterion(model, logits, labels)
             total_loss += loss.item()
 
             preds = torch.argmax(logits, dim=-1)
@@ -106,25 +106,27 @@ def evaluate(model, dataloader, criterion, device="cuda"):
 def main():
     print('Loading DCFT Model')
     label_map = {'label2id': {'acceptable': 1, 'unacceptable': 0}, 'id2label': {0: 'unacceptable', 1: 'acceptable'}}
-    model_name = 'microsoft/deberta-base'
+    model_name = 'microsoft/deberta-v3-base'
     d, k = 8, 1
-    EPOCHS = 2
-    lr = 1e-4
-    batch_size = 16
+    EPOCHS = 3
+    lr = 5e-4
+    batch_size = 32
+    dropout = 0.5
+    alpha = 0.1
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     tokenizer, base_model = load_base_model(model_name=model_name, label_map=label_map)
-    dcft_model = get_dcft_mode(base_model, d, k)
+    dcft_model = get_dcft_mode(base_model, d, k, dropout)
     
     print('Loading Cola Data')
     train_dataloader, validation_dataloader = load_data(tokenizer, batch_size=batch_size)
     batch = next(iter(train_dataloader))
     batch.pop('label')
-    print(summary(dcft_model, input_data=dict(batch)))
-
+    summary(dcft_model, input_data=dict(batch))
 
     optimizer = AdamW(dcft_model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=len(train_dataloader)*EPOCHS, eta_min=1e-6)
-    criterion = nn.CrossEntropyLoss()
+    criterion = DCFTLoss(alpha=alpha)
     dcft_model = train(
         model=dcft_model,
         num_epochs=EPOCHS,
